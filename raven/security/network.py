@@ -15,7 +15,11 @@ hostname, so Host, SNI and the certificate check still name the site.
 The judge resolves, and ``socket.getaddrinfo`` is synchronous: on a slow
 resolver it holds for seconds. One process serves every session's turn, so
 every async caller runs the judge through :func:`asyncio.to_thread` and the
-resolution waits in a worker instead of on the loop.
+resolution waits in a worker instead of on the loop. The wait itself is
+bounded: a resolver that never answers can stall a turn without ever raising,
+so after :data:`RESOLVER_TIMEOUT_SECONDS` the target is refused with the
+reason spelled out -- never allowed, which would turn a dead resolver into
+an unchecked fetch.
 
 Ported from nanobot/security/network.py (MIT) with the module-level CIDR
 allowlist removed; revisit if a Tailscale-style whitelist becomes needed.
@@ -40,6 +44,11 @@ if TYPE_CHECKING:
 # Redirect chains have to end. Each hop costs a DNS resolution and a request,
 # and no legitimate media URL needs many.
 DEFAULT_MAX_REDIRECTS = 5
+
+#: The longest a DNS answer may take before the target is refused. The
+#: resolver itself takes no deadline -- a hung ``getaddrinfo`` holds its
+#: worker thread past the refusal until the platform's resolver returns.
+RESOLVER_TIMEOUT_SECONDS = 30.0
 
 #: Deployment-level widening, the same class of switch as
 #: ``RAVEN_BROWSER_BLOCK_PRIVATE`` but in the other direction: set to
@@ -198,6 +207,29 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
     return ok, err
 
 
+async def validate_url_target_async(url: str) -> tuple[bool, str]:
+    """The bounded, off-loop form of :func:`validate_url_target`.
+
+    The judge waits in a worker so a slow resolver does not hold the loop,
+    and the wait itself is capped: a resolver that never answers can stall a
+    turn without ever raising. On the deadline the target is refused rather
+    than allowed -- a dead resolver is not a reason to fetch unchecked.
+    """
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(validate_url_target, url), timeout=RESOLVER_TIMEOUT_SECONDS)
+    except TimeoutError:
+        return False, f"Resolver did not answer within {RESOLVER_TIMEOUT_SECONDS:g} s"
+
+
+async def _judged(url: str, *, resolved: bool) -> tuple[bool, str, tuple[str, ...]]:
+    """One hop's verdict, off the loop and under the resolver deadline."""
+    judge = judge_resolved_url if resolved else judge_url_target
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(judge, url), timeout=RESOLVER_TIMEOUT_SECONDS)
+    except TimeoutError:
+        return False, f"Resolver did not answer within {RESOLVER_TIMEOUT_SECONDS:g} s", ()
+
+
 def _pin_request(current: str, addrs: tuple[str, ...]) -> tuple[str, dict]:
     """The request that connects to a judged address while answering as the hostname.
 
@@ -248,7 +280,9 @@ async def guarded_fetch(
     them (rebinding) has nothing left to bite. The URL keeps the hostname for
     ``Host``, SNI and certificate verification; only the TCP connection is
     pinned. The resolution itself runs in a worker thread, because it is
-    synchronous and one process serves every session's turn.
+    synchronous and one process serves every session's turn, and it is
+    refused after :data:`RESOLVER_TIMEOUT_SECONDS` because a resolver that
+    never answers can stall a turn without ever raising.
 
     The chain is followed by hand, with ``follow_redirects=False`` on each
     request, because that is the only way each hop gets checked: a client that
@@ -264,12 +298,11 @@ async def guarded_fetch(
     """
     current = url
     for hop in range(max_redirects + 1):
-        # Off the loop: ``socket.getaddrinfo`` is synchronous and can hold for
-        # seconds on a slow resolver, and one process serves every session's
-        # turn. The judge is looked up per hop, so a caller that patches the
-        # module's names still lands.
-        judge = judge_url_target if hop == 0 else judge_resolved_url
-        ok, err, addrs = await asyncio.to_thread(judge, current)
+        # Off the loop and bounded: ``socket.getaddrinfo`` is synchronous and
+        # can hold for seconds on a slow resolver -- or never return -- and one
+        # process serves every session's turn. The judge is looked up per hop,
+        # so a caller that patches the module's names still lands.
+        ok, err, addrs = await _judged(current, resolved=hop != 0)
         if not ok:
             logger.warning("{}: refusing {} ({})", what, current, err)
             return None

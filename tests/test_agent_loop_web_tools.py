@@ -287,7 +287,11 @@ async def test_a_reader_key_set_after_a_refusal_reaches_the_next_call(workspace,
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"tools": {"web": {"providers": {"tavily": {"apiKey": "sk-boot"}}}}}), encoding="utf-8")
     monkeypatch.setattr("raven.home._current_config_path", cfg)
-    monkeypatch.setattr("raven.agent.tools.web.validate_url_target", lambda url: (True, ""))
+
+    async def _open(_url: str):
+        return True, ""
+
+    monkeypatch.setattr("raven.agent.tools.web.validate_url_target_async", _open)
     client = _RefusingThenServing()
     monkeypatch.setattr("raven.agent.tools.web.httpx.AsyncClient", client)
     loop = _loop(workspace, web_fetch_provider="tavily", web_provider_keys={"tavily": "sk-boot"})
@@ -321,7 +325,11 @@ async def test_a_reader_whose_key_is_cleared_in_the_file_reads_through_jina(
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"tools": {"web": {"providers": {"tavily": {"apiKey": "sk-boot"}}}}}), encoding="utf-8")
     monkeypatch.setattr("raven.home._current_config_path", cfg)
-    monkeypatch.setattr("raven.agent.tools.web.validate_url_target", lambda url: (True, ""))
+
+    async def _open(_url: str):
+        return True, ""
+
+    monkeypatch.setattr("raven.agent.tools.web.validate_url_target_async", _open)
     sent: list[tuple[str, dict]] = []
 
     class _Reader:

@@ -24,7 +24,11 @@ def _reader(monkeypatch, handler) -> dict[str, list[httpx.Request]]:
         return real(*args, **kwargs)
 
     monkeypatch.setattr(_sources.httpx, "AsyncClient", factory)
-    monkeypatch.setattr(_sources, "validate_url_target", lambda url: (True, ""))
+
+    async def _open(_url: str):
+        return True, ""
+
+    monkeypatch.setattr(_sources, "validate_url_target_async", _open)
     return seen
 
 
@@ -94,7 +98,11 @@ async def test_a_configured_key_is_sent_and_an_absent_one_is_not(monkeypatch) ->
 async def test_a_refused_url_never_reaches_the_network(monkeypatch) -> None:
     """Without this the endpoint is a request forger: it takes a URL from a
     browser and answers with the body of whatever the gateway can reach."""
-    monkeypatch.setattr(_sources, "validate_url_target", lambda url: (False, "blocked host"))
+
+    async def _refused(_url: str):
+        return False, "blocked host"
+
+    monkeypatch.setattr(_sources, "validate_url_target_async", _refused)
 
     def _explode(request: httpx.Request) -> httpx.Response:
         pytest.fail("must not fetch a refused target")

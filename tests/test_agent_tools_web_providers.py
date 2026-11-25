@@ -498,7 +498,11 @@ def test_a_keyed_reader_without_a_key_is_replaced_by_jina(monkeypatch: pytest.Mo
 def _open_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """The SSRF gate resolves the hostname, which a test host must not do; the
     gate has its own suite (``test_security_web_ssrf``)."""
-    monkeypatch.setattr(web_mod, "validate_url_target", lambda url: (True, ""))
+
+    async def _open(_url: str):
+        return True, ""
+
+    monkeypatch.setattr(web_mod, "validate_url_target_async", _open)
 
     async def unavailable(self, url):
         raise httpx.ConnectError("Direct origin unavailable")

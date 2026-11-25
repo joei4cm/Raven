@@ -669,6 +669,54 @@ async def test_a_redirect_hop_judges_off_the_event_loop(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The resolver deadline
+# ---------------------------------------------------------------------------
+
+
+def _hung_resolver(monkeypatch: pytest.MonkeyPatch, hold: float = 0.5) -> None:
+    """A resolver that holds for *hold* seconds -- far past the patched deadline."""
+    _slow_resolver(monkeypatch, "93.184.216.34", hold)
+
+
+async def test_a_resolver_that_never_answers_refuses_the_target(monkeypatch) -> None:
+    """The wait is bounded: a resolver that never answers can stall a turn
+    without ever raising, so the deadline refuses the target -- it does not
+    pass it, which would turn a dead resolver into an unchecked fetch."""
+    _hung_resolver(monkeypatch)
+    monkeypatch.setattr(net, "RESOLVER_TIMEOUT_SECONDS", 0.05)
+
+    ok, err = await net.validate_url_target_async("https://cdn.example.test/a.png")
+
+    assert not ok
+    assert "Resolver did not answer" in err
+
+
+async def test_guarded_fetch_refuses_a_hop_its_resolver_never_answered(monkeypatch) -> None:
+    """The deadline holds inside the chain too, on hop 0's judge -- and the
+    refusal is still never contact: nothing is requested before the verdict."""
+    _hung_resolver(monkeypatch)
+    monkeypatch.setattr(net, "RESOLVER_TIMEOUT_SECONDS", 0.05)
+
+    from raven.security.network import guarded_fetch
+
+    rec = _Recorder([(200, "")])
+
+    out = await guarded_fetch(rec, "https://cdn.example.test/a.png", what="test")
+
+    assert out is None
+    assert rec.requested == [], "a hop its resolver never judged is not fetched"
+
+
+async def test_a_slow_answer_inside_the_deadline_still_wins(monkeypatch) -> None:
+    """The deadline refuses only what it outwaits: a slow-but-live resolver
+    answers the verdict its own thread returns, unchanged."""
+    _slow_resolver(monkeypatch, "93.184.216.34", 0.1)
+    monkeypatch.setattr(net, "RESOLVER_TIMEOUT_SECONDS", 30.0)
+
+    assert await net.validate_url_target_async("https://cdn.example.test/a.png") == (True, "")
+
+
+# ---------------------------------------------------------------------------
 # The fake-IP opt-in (RAVEN_NETWORK_ALLOW_BENCHMARK)
 #
 # 198.18.0.0/15 is in the threat table above because the default install

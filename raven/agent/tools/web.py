@@ -23,7 +23,7 @@ from lxml import etree, html
 
 from raven.config.schema import WEB_VENDOR_ENV_VARS
 from raven.contracts.tool import Tool
-from raven.security.network import guarded_fetch, validate_url_target
+from raven.security.network import guarded_fetch, validate_url_target_async
 
 
 @dataclass(frozen=True)
@@ -1200,10 +1200,10 @@ class WebFetchTool(Tool):
 
     async def execute(self, url: str, maxChars: int | None = None, **kwargs: Any) -> str:  # noqa: N803  (LLM tool schema uses camelCase)
         max_chars = maxChars or self.max_chars
-        # Off the loop: the judge resolves, and a slow resolver holds the whole
-        # process -- HTTP, RPC, WebSocket frames and every other session's turn
-        # with it.
-        is_valid, error_msg = await asyncio.to_thread(validate_url_target, url)
+        # Off the loop and bounded: the judge resolves, and a slow resolver
+        # holds the whole process -- HTTP, RPC, WebSocket frames and every
+        # other session's turn with it -- while a dead one holds this call.
+        is_valid, error_msg = await validate_url_target_async(url)
         if not is_valid:
             # The same rule as the handlers below: most of these reasons name the
             # hostname, and a reader whose every target is refused is one cause.

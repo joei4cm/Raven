@@ -28,7 +28,11 @@ def transport(monkeypatch):
         "AsyncClient",
         lambda **kwargs: client_type(**kwargs, transport=httpx.MockTransport(handle)),
     )
-    monkeypatch.setattr(web, "validate_url_target", lambda url: (True, ""))
+
+    async def _open(_url: str):
+        return True, ""
+
+    monkeypatch.setattr(web, "validate_url_target_async", _open)
     monkeypatch.setattr(network, "judge_url_target", lambda url: (True, "", ()))
     monkeypatch.setattr(network, "judge_resolved_url", lambda url: (True, "", ()))
     return responses, calls
