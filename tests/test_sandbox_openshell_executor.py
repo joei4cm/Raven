@@ -542,6 +542,25 @@ class TestExec:
             await task
         assert blocking.cancelled.is_set()
 
+    async def test_a_cancellation_inside_the_timeout_grace_still_cancels(self, tmp_path, monkeypatch):
+        """The collect that carries a late timeout report used to answer a
+        cancelled caller with an ExecResult: the turn went on, believing the
+        command merely timed out."""
+        monkeypatch.setattr(ox, "_KILL_GRACE_SECONDS", 0.5)
+        cp = FakeControlPlane()
+        ex = _executor(tmp_path, cp)
+        await ex.start()
+        blocking = FakeStream(block=True)
+        cp.exec_script = lambda argv: blocking
+        task = asyncio.create_task(ex.exec("sleep 100", timeout=0.05))
+        # The command times out at 0.05 and the collect's grace holds the call
+        # until 0.55; at 0.2 the task is inside the grace.
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert blocking.cancelled.is_set()
+
     async def test_exec_before_start_starts_the_sandbox(self, tmp_path):
         cp = FakeControlPlane()
         ex = _executor(tmp_path, cp)

@@ -312,10 +312,16 @@ async def _drain_to_result(stream: ExecStream) -> ExecResult:
 
 
 async def _collect(drain: asyncio.Task, grace: float) -> ExecResult | None:
-    """The result of a drain that is already running, or None if it does not land in time."""
+    """The result of a drain that is already running, or None if it does not land in time.
+
+    Only the grace's own deadline maps to None. A CancelledError here is the
+    caller's cancellation landing inside the grace -- the command's owner
+    stopped waiting -- and folding it into the same None would hand the caller
+    a timeout receipt for a run it never asked to keep.
+    """
     try:
         return await asyncio.wait_for(asyncio.shield(drain), grace)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except asyncio.TimeoutError:
         return None
 
 
@@ -767,25 +773,32 @@ class OpenShellExecutor(SandboxExecutor):
         drain = asyncio.ensure_future(_drain_to_result(stream))
         started = asyncio.get_running_loop().time()
         try:
-            # timeout=0 times out at once, as it does for the direct executor.
-            result = await asyncio.wait_for(asyncio.shield(drain), effective)
-        except asyncio.TimeoutError:
-            # The gateway enforces the same budget and reports it as exit 124,
-            # so the command is already over; give that report a moment to
-            # arrive before the call is killed.
-            receipt = await _collect(drain, _KILL_GRACE_SECONDS if effective > 0 else 0)
-            stream.cancel()
-            note = f"Command timed out after {effective}s"
-            if receipt is None:
-                return ExecResult(stdout="", stderr=note, exit_code=-1)
-            if receipt.exit_code == _SERVER_TIMEOUT_EXIT:
-                return ExecResult(
-                    stdout=receipt.stdout, stderr=f"{receipt.stderr}\n{note}" if receipt.stderr else note, exit_code=-1
-                )
-            if receipt.exit_code < 0:
-                return ExecResult(stdout=receipt.stdout, stderr=note, exit_code=-1)
-            return receipt
+            try:
+                # timeout=0 times out at once, as it does for the direct executor.
+                result = await asyncio.wait_for(asyncio.shield(drain), effective)
+            except asyncio.TimeoutError:
+                # The gateway enforces the same budget and reports it as exit 124,
+                # so the command is already over; give that report a moment to
+                # arrive before the call is killed.
+                receipt = await _collect(drain, _KILL_GRACE_SECONDS if effective > 0 else 0)
+                stream.cancel()
+                note = f"Command timed out after {effective}s"
+                if receipt is None:
+                    return ExecResult(stdout="", stderr=note, exit_code=-1)
+                if receipt.exit_code == _SERVER_TIMEOUT_EXIT:
+                    return ExecResult(
+                        stdout=receipt.stdout,
+                        stderr=f"{receipt.stderr}\n{note}" if receipt.stderr else note,
+                        exit_code=-1,
+                    )
+                if receipt.exit_code < 0:
+                    return ExecResult(stdout=receipt.stdout, stderr=note, exit_code=-1)
+                return receipt
         except asyncio.CancelledError:
+            # In a nested try because a raise inside an except block above -- a
+            # cancellation that lands inside the collect's grace -- never
+            # reaches a sibling except, and folding it into the timeout's
+            # answer would stop the command without stopping the caller.
             stream.cancel()
             drain.cancel()
             raise
