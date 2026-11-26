@@ -97,6 +97,16 @@ into one."""
 _TASKKILL_TIMEOUT_S = 5.0
 """How long a stop on Windows waits for ``taskkill`` before killing the launcher alone."""
 
+_DETACHED_PIPE_GRACE = 1.0
+"""How long the pumps may keep reading after the launcher's exit notice. A
+launcher that waited for its children closes its pipes within a loop iteration
+or two of exiting; pipes still open past the grace belong to a helper the
+agent did not wait for, and what it writes from here on is nobody's
+transcript."""
+
+_STREAM_LIMIT = 2**16
+"""The reader limit ``create_subprocess_exec`` would have used."""
+
 
 def _one_line(said: str) -> str:
     """One line, capped.
@@ -172,6 +182,30 @@ def _human_failure(stdout: str, stderr: str) -> str:
             if line and not _framed(line):
                 return _one_line(line)
     return ""
+
+
+class _ExitNotifyingProtocol(asyncio.subprocess.SubprocessStreamProtocol):
+    """The protocol ``create_subprocess_exec`` builds, plus an exit signal that
+    does not wait for the pipes.
+
+    ``Process.wait()`` cannot be that signal. asyncio wakes its waiters from
+    ``_call_connection_lost``, and ``_try_finish`` schedules that only once
+    every pipe has disconnected (CPython 3.12 ``base_subprocess.py``). An agent
+    that daemonizes a helper -- the helper inherits the open stdout -- exits at
+    once while the pipes stay open, so a run whose agent is done would wait out
+    the helper's whole life instead. ``process_exited`` runs as soon as the
+    child watcher reports the agent, after the return code is recorded. The
+    twin of ``raven.sandbox.direct_executor._ExitNotifyingProtocol``, which
+    carries the same cure for shell commands.
+    """
+
+    def __init__(self, exited: asyncio.Event, *, limit: int, loop: asyncio.AbstractEventLoop) -> None:
+        super().__init__(limit=limit, loop=loop)
+        self._exited = exited
+
+    def process_exited(self) -> None:
+        super().process_exited()
+        self._exited.set()
 
 
 class CliAgentTimeoutError(RuntimeError):
@@ -424,6 +458,9 @@ class CliAgentBackend:
         proc: asyncio.subprocess.Process,
         stdin_bytes: bytes | None,
         on_delta: Callable[[str], Awaitable[None]] | None,
+        *,
+        exited: asyncio.Event,
+        pgid: int,
     ) -> tuple[bytes, bytes]:
         """``communicate()``, plus the run's output observed as it lands.
 
@@ -453,6 +490,12 @@ class CliAgentBackend:
         Stdout is drained concurrently with the stdin write for the reason
         ``communicate`` does it: a child that fills the stdout pipe while raven
         is still writing its prompt deadlocks both ends.
+
+        The finish line is the launcher's exit notice (``exited``), not EOF on
+        every pipe. An agent that daemonizes a helper exits at once while the
+        helper's inherited stdout keeps the pipe open, so waiting for EOF --
+        what the bare pump gather below used to do -- waited out the helper's
+        whole life for an agent that was already done.
         """
         publish_out_line = self._line_publisher(on_delta)
         out_chunks: list[bytes] = []
@@ -498,16 +541,49 @@ class CliAgentBackend:
                 activity.note_console(pending.decode("utf-8", "replace"))
 
         pumps = [asyncio.create_task(coro) for coro in (feed(), pump_out(), pump_err())]
+        eof = asyncio.ensure_future(asyncio.gather(*pumps))
+        exited_wait = asyncio.create_task(exited.wait())
         try:
-            await asyncio.gather(*pumps)
+            await asyncio.wait([eof, exited_wait], return_when=asyncio.FIRST_COMPLETED)
+            if eof.done():
+                # Every pipe reached EOF: the ordinary reap. Awaiting the
+                # gather keeps the bare gather's contract -- the first pump
+                # error propagates from here.
+                await eof
+                await proc.wait()
+            else:
+                # The exit notice won with pipes still open, so a helper the
+                # agent did not wait for is holding them. The grace carries the
+                # launcher's own tail (writes land before the exit is reported;
+                # the reads may not have run yet), and the group is then put
+                # down the way the timeout path already does -- the helper
+                # stayed in the launcher's group unless it made its own session,
+                # and a run does not outlive its process group.
+                await asyncio.wait(pumps, timeout=_DETACHED_PIPE_GRACE)
+                for pump in pumps:
+                    if pump.done() and not pump.cancelled() and (exc := pump.exception()) is not None:
+                        if eof.done():
+                            eof.exception()
+                        raise exc
+                if not all(pump.done() for pump in pumps):
+                    await self._kill_process_group(proc, pgid)
         finally:
             # gather leaves its siblings running when one of them raises -- a
             # delta sink whose client went away would otherwise leave two tasks
-            # reading a subprocess nobody is waiting for any more.
+            # reading a subprocess nobody is waiting for any more. The exit
+            # race's loser is cancelled with them.
             for pump in pumps:
                 pump.cancel()
             await asyncio.gather(*pumps, return_exceptions=True)
-        await proc.wait()
+            for stray in (eof, exited_wait):
+                stray.cancel()
+                if not stray.done():
+                    try:
+                        await stray
+                    except asyncio.CancelledError:
+                        pass
+        if proc.returncode is None:
+            await proc.wait()
         return b"".join(out_chunks), b"".join(err_chunks)
 
     async def _exec(
@@ -555,7 +631,14 @@ class CliAgentBackend:
             # own instead, and the launcher would not be found.
             argv = resolve_program(argv, env, cwd=cwd)
             logger.info("Subagent [{}] CLI agent {!r}: {}", task_id, self.name, argv[:1])
-            proc = await asyncio.create_subprocess_exec(
+            loop = asyncio.get_running_loop()
+            exited = asyncio.Event()
+            # Spawned through the loop with the exit-notifying protocol rather
+            # than create_subprocess_exec (which builds the stock one): the
+            # capture's finish line is the launcher's exit notice, and the
+            # stock protocol offers no moment earlier than every pipe's EOF.
+            transport, protocol = await loop.subprocess_exec(
+                lambda: _ExitNotifyingProtocol(exited, limit=_STREAM_LIMIT, loop=loop),
                 *argv,
                 # Inheriting the parent's stdin (None) would leave it open on a
                 # non-TTY pipe (e.g. under a supervisor), and codex exec reads
@@ -569,6 +652,7 @@ class CliAgentBackend:
                 # the whole tree with killpg instead of only this launcher.
                 start_new_session=True,
             )
+            proc = asyncio.subprocess.Process(transport, protocol, loop)
             # Captured now, not re-derived later: `start_new_session=True`
             # makes the launcher's pid double as the group's pgid, and this
             # is the only reliable point to read it, before the launcher can
@@ -579,7 +663,7 @@ class CliAgentBackend:
             # activity console watches every run now, not only the ones whose
             # caller asked to stream the reply. The pump returns the same bytes
             # the buffered call did.
-            capture = self._communicate_streaming(proc, stdin_bytes, on_delta)
+            capture = self._communicate_streaming(proc, stdin_bytes, on_delta, exited=exited, pgid=pgid)
             try:
                 if self.timeout is not None:
                     out, err = await asyncio.wait_for(capture, timeout=self.timeout)

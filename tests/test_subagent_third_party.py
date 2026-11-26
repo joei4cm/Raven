@@ -34,6 +34,7 @@ from raven.agent.subagent.backends import (
     format_agent_listing,
     third_party_agent_meta,
 )
+from raven.agent.subagent.backends.cli_agent import _STREAM_LIMIT, _ExitNotifyingProtocol
 from raven.agent.subagent.backends.env import login_shell_env, refresh_login_shell_env
 from raven.agent.subagent.builtin_agents import GENERIC_AGENT
 from raven.agent.subagent.manager import SPAWN_REFUSED_PREFIX, SubagentManager
@@ -536,11 +537,11 @@ async def test_cli_backend_on_windows_starts_a_bare_program_from_the_childs_path
     monkeypatch.setattr(env_mod, "_LOGIN_ENV", {"PATH": str(fresh_bin)})
     started: list[tuple[str, ...]] = []
 
-    async def refuse(*argv: str, **_: Any) -> NoReturn:
+    async def refuse(protocol_factory: Any, *argv: str, **_: Any) -> NoReturn:
         started.append(argv)
         raise FileNotFoundError(2, "not started in a test")
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
+    monkeypatch.setattr(asyncio.get_running_loop(), "subprocess_exec", refuse)
     be = CliAgentBackend(
         name="fresh", command="fresh-agent -p {prompt}", registry=InstanceRegistry(path=tmp_path / "inst.json")
     )
@@ -568,11 +569,11 @@ async def test_cli_backend_on_windows_starts_a_relative_launcher_from_the_row_cw
     monkeypatch.setattr(env_mod, "_LOGIN_ENV", {"PATH": "/nowhere"})
     started: list[tuple[str, ...]] = []
 
-    async def refuse(*argv: str, **_: Any) -> NoReturn:
+    async def refuse(protocol_factory: Any, *argv: str, **_: Any) -> NoReturn:
         started.append(argv)
         raise FileNotFoundError(2, "not started in a test")
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
+    monkeypatch.setattr(asyncio.get_running_loop(), "subprocess_exec", refuse)
     be = CliAgentBackend(
         name="rowagent",
         command="./agent-acp -p {prompt}",
@@ -627,11 +628,11 @@ async def test_cli_backend_on_windows_never_starts_a_batch_file_for_a_bare_name(
     monkeypatch.setattr(env_mod, "_LOGIN_ENV", {"PATH": str(npm_bin)})
     started: list[tuple[str, ...]] = []
 
-    async def refuse(*argv: str, **_: Any) -> NoReturn:
+    async def refuse(protocol_factory: Any, *argv: str, **_: Any) -> NoReturn:
         started.append(argv)
         raise FileNotFoundError(2, "not started in a test")
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
+    monkeypatch.setattr(asyncio.get_running_loop(), "subprocess_exec", refuse)
     be = CliAgentBackend(
         name="codex", command="codex exec {prompt}", registry=InstanceRegistry(path=tmp_path / "i.json")
     )
@@ -821,6 +822,31 @@ async def test_cli_backend_timeout_raises(tmp_path: Path) -> None:
     be = CliAgentBackend(name="slow", command="sleep 5", timeout=0.2)
     with pytest.raises(RuntimeError):
         await be.run("x", task_id="t5", workspace=tmp_path, executor=None)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="start_new_session and killpg are posix")
+async def test_a_detached_grandchild_holding_the_pipe_does_not_hang_the_run(tmp_path: Path) -> None:
+    """An agent that daemonizes a helper is done when it exits, not when every
+    pipe closes. The helper inherits the open stdout, so waiting for EOF -- the
+    old capture's finish line -- held the run for the helper's whole life; the
+    run must return the agent's own output instead, and take the helper down
+    with the launcher's group rather than leave it reading a dead pipe."""
+    script = tmp_path / "daemonizing.sh"
+    script.write_text(
+        f"#!/bin/sh\n{PYTHON} -c 'import time; time.sleep(30)' &\necho $! > helper.pid\necho agent-done\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    be = CliAgentBackend(name="daemonizer", command=f"{script} {{prompt}}")
+    out = await asyncio.wait_for(
+        be.run("x", task_id="t-pipe", workspace=tmp_path, executor=None),
+        timeout=15,
+    )
+
+    assert out == "agent-done"
+    helper = int((tmp_path / "helper.pid").read_text(encoding="utf-8").strip())
+    assert not pid_alive(helper), "the helper stayed in the group and dies with the run"
 
 
 async def test_cli_backend_publishes_stdout_to_the_live_console(tmp_path: Path) -> None:
@@ -4347,13 +4373,17 @@ async def test_the_line_pump_leaves_no_task_behind_when_the_sink_raises(tmp_path
         encoding="utf-8",
     )
     be = _streaming_cli(tmp_path, "unused")
-    proc = await asyncio.create_subprocess_exec(
+    loop = asyncio.get_running_loop()
+    exited = asyncio.Event()
+    transport, protocol = await loop.subprocess_exec(
+        lambda: _ExitNotifyingProtocol(exited, limit=_STREAM_LIMIT, loop=loop),
         sys.executable,
         str(script),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    proc = asyncio.subprocess.Process(transport, protocol, loop)
 
     async def boom(text: str) -> None:
         raise RuntimeError("client went away")
@@ -4361,7 +4391,7 @@ async def test_the_line_pump_leaves_no_task_behind_when_the_sink_raises(tmp_path
     before = asyncio.all_tasks()
     try:
         with pytest.raises(RuntimeError, match="client went away"):
-            await be._communicate_streaming(proc, None, boom)
+            await be._communicate_streaming(proc, None, boom, exited=exited, pgid=proc.pid)
         assert asyncio.all_tasks() - before - {asyncio.current_task()} == set()
     finally:
         proc.kill()
