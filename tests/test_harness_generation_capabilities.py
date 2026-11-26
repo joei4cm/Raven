@@ -498,6 +498,32 @@ def test_stored_playbook_refuses_unknown_empty_and_disabled_fields(playbook, mes
         AgentPlaybookSpec.model_validate({"delegate": [{"name": "worker", "playbook": playbook}]})
 
 
+def test_the_check_implementation_switch_and_the_field_it_gates_are_withheld_together(tmp_path, monkeypatch) -> None:
+    """``checksImpl`` is reserved as a unit, not as a field that happens to be off.
+
+    The catalogue keeps the switch disabled and the model refuses the field, so
+    the two are asserted together: wiring the field means moving both, and this
+    test is what says so. Turning the switch on is refused at load rather than
+    here -- ``_validate_connected`` owns that, and the third case pins it for
+    this switch -- so the first two cases hold the half that gate does not: the
+    model still refusing the field while the catalogue holds the switch off.
+    """
+    assert harness_capabilities.parameter_enabled("action", "checksImpl") is False
+    with pytest.raises(ValidationError, match="disabled harness field.*action.checksImpl"):
+        AgentPlaybookSpec.model_validate(
+            {"delegate": [{"name": "worker", "playbook": {"action": {"checks": {"impl": "custom"}}}}]}
+        )
+
+    document = json.loads(harness_capabilities._PATH.read_text(encoding="utf-8"))
+    document["harnessGeneration"]["action"]["parameters"]["items"]["checksImpl"]["enabled"] = True
+    path = tmp_path / "harness_generation.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(harness_capabilities, "_PATH", path)
+
+    with pytest.raises(RuntimeError, match="enabled but not wired: action.parameters.checksImpl"):
+        harness_capabilities.parameter_enabled("action", "checksImpl")
+
+
 @pytest.mark.asyncio
 async def test_enabled_functions_generate_bind_and_execute_through_module_composers() -> None:
     from raven.agent.harness.participants import compose_advice, compose_intake, compose_salvage
