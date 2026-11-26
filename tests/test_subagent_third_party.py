@@ -34,6 +34,7 @@ from raven.agent.subagent.backends import (
     format_agent_listing,
     third_party_agent_meta,
 )
+from raven.agent.subagent.backends.cli_agent import CliAgentExitedError
 from raven.agent.subagent.backends.env import login_shell_env, refresh_login_shell_env
 from raven.agent.subagent.builtin_agents import GENERIC_AGENT
 from raven.agent.subagent.manager import SPAWN_REFUSED_PREFIX, SubagentManager
@@ -2651,7 +2652,7 @@ async def test_resume_fallback_reuses_one_mcp_file_and_deletes_it(tmp_path: Path
             paths.append(mcp_file)
             payloads.append(json.loads(Path(mcp_file).read_text(encoding="utf-8")))
             if template == self.resume_command:
-                raise RuntimeError("stale session")
+                raise CliAgentExitedError("stale session")
             return "created", ""
 
     registry = InstanceRegistry(path=tmp_path / "inst.json")
@@ -2677,6 +2678,51 @@ async def test_resume_fallback_reuses_one_mcp_file_and_deletes_it(tmp_path: Path
     assert len(paths) == 2 and paths[0] == paths[1]
     assert payloads[0] == payloads[1] == {"tools": {"mcpServers": {}, "disabledTools": []}}
     assert not Path(paths[0]).exists()
+
+
+async def test_a_transport_error_on_resume_keeps_the_binding(tmp_path: Path) -> None:
+    """Only a hard non-zero exit is evidence the CLI's session store pruned the
+    bound id. A link that drops -- the transport error the machine lane wraps
+    the same way -- says nothing about the id, so unbinding on it made the next
+    dispatch silently open a second session where the first was still valid."""
+    link_down = True
+
+    class LinkFlaky(CliAgentBackend):
+        async def _exec(
+            self,
+            template: str,
+            task: str,
+            task_id: str,
+            cwd: str,
+            agent_id: str | None,
+            attempts: list[dict[str, Any]] | None = None,
+            on_delta: Any = None,
+            runtime_env: dict[str, str] | None = None,
+            mcp_file: str | None = None,
+        ) -> tuple[str, str]:
+            if link_down:
+                raise RuntimeError("the machine's link dropped")
+            return "fresh-session-reply", ""
+
+    reg = InstanceRegistry(path=tmp_path / "inst.json")
+    await reg.commit("s", "flaky", "h", "bound-id")
+    be = LinkFlaky(
+        name="flaky",
+        command="agent {agent_id}",
+        resume_command="agent --resume {agent_id}",
+        registry=reg,
+    )
+
+    with pytest.raises(RuntimeError, match="link dropped"):
+        await be.run("t", task_id="t1", workspace=tmp_path, executor=None, session_key="s", instance="h")
+    assert await reg.lookup("s", "flaky", "h") == "bound-id", "the drop is not proof the session is gone"
+
+    link_down = False
+    assert (
+        await be.run("t", task_id="t2", workspace=tmp_path, executor=None, session_key="s", instance="h")
+        == "fresh-session-reply"
+    )
+    assert await reg.lookup("s", "flaky", "h") == "bound-id"
 
 
 async def test_cli_backend_uses_the_prepared_dispatch_grant_without_resolving_again(tmp_path: Path) -> None:

@@ -191,6 +191,19 @@ class CliAgentReportedError(RuntimeError):
     """
 
 
+class CliAgentExitedError(RuntimeError):
+    """Raised when the CLI itself exits non-zero.
+
+    Kept distinct from the transport errors around it because the resume
+    path's one retry rule is keyed on it: only a hard exit is evidence the
+    CLI's own session store may have pruned the bound id, the reason a failed
+    resume drops the binding and retries as a create. A link that broke, a
+    spawn that never ran the command, is no such evidence -- the id is still
+    bound where it was, and unbinding on it would make the next dispatch
+    silently lose the session.
+    """
+
+
 @dataclass(frozen=True)
 class _OnMachine:
     """One dispatch's place on its machine, resolved through the machine's Raven node."""
@@ -621,7 +634,9 @@ class CliAgentBackend:
                 # the instance's conversation and in the DAG node's error, so a
                 # 2000-char JSON dump was shown to whoever was watching.
                 said = _human_failure(stdout, stderr)
-                raise RuntimeError(f"CLI agent {self.name!r} exited {proc.returncode}" + (f": {said}" if said else ""))
+                raise CliAgentExitedError(
+                    f"CLI agent {self.name!r} exited {proc.returncode}" + (f": {said}" if said else "")
+                )
             return stdout, stderr
         finally:
             try:
@@ -769,7 +784,7 @@ class CliAgentBackend:
             )
         if rc != 0:
             said = _human_failure(stdout, stderr)
-            raise RuntimeError(f"CLI agent {self.name!r} exited {rc}" + (f": {said}" if said else ""))
+            raise CliAgentExitedError(f"CLI agent {self.name!r} exited {rc}" + (f": {said}" if said else ""))
         return stdout, stderr
 
     async def _on_machine(self, handle: str) -> _OnMachine:
@@ -1184,7 +1199,13 @@ class CliAgentBackend:
                 # error can happen inside a perfectly valid session. Forgetting
                 # the handle here would discard a valid binding for nothing.
                 raise
-            except Exception:  # noqa: BLE001 - a hard non-zero exit: the CLI's own session store may have pruned this id
+            except CliAgentExitedError:
+                # Only a hard exit is the evidence this branch acts on: the
+                # CLI's own session store may have pruned the bound id. A
+                # transport failure around it -- a dropped link to the machine,
+                # a launcher that never ran -- says nothing about the id, so the
+                # binding stays and the next dispatch resumes instead of
+                # silently opening a second session.
                 # A caller watching this turn keeps whatever the failed attempt
                 # streamed, and the retry appends to it. Measured on claude: a
                 # resume of an unknown id exits before emitting any text delta,
