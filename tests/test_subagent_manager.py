@@ -6698,6 +6698,52 @@ async def test_a_spawn_onto_an_overridden_instance_sends_the_override_and_not_th
     assert backend.seen == [("high", None), (None, "low")]
 
 
+async def test_a_direct_chat_left_on_its_machine_is_not_recorded_cancelled(tmp_path, monkeypatch) -> None:
+    """The gateway's shutdown cancels every task in the manager's index, a
+    direct chat's task among them, and the machine backends keep the run alive
+    deliberately in exactly that case (``remote_runs.mark_left``). The spawn
+    lane reads that marker before writing "cancelled"; the chat lane used to
+    skip it, so a run still running on its machine was reported cancelled to
+    its conversation."""
+    from raven.acp_client import remote_runs
+    from raven.agent.subagent.instances import InstanceRegistry
+
+    mgr = _effort_row_manager(tmp_path, monkeypatch, _mode_effort_snapshot)
+    monkeypatch.setattr(manager_mod, "build_executor", lambda *a, **k: _DummyExecutor())
+    entered = asyncio.Event()
+    captured: dict[str, str] = {}
+
+    class LeftBackend:
+        streams = False
+
+        async def run(self, task: str, **kwargs: Any) -> str:
+            captured["task_id"] = kwargs["task_id"]
+            # The backends do this from their cancel paths on a registered
+            # machine: the run stays with the machine's daemon, and its marker
+            # tells the manager this cancellation is a shutdown, not a stop.
+            remote_runs.mark_left(kwargs["task_id"])
+            entered.set()
+            await asyncio.Event().wait()
+            return "unreached"
+
+    mgr.registry._backends["Pi"] = LeftBackend()
+
+    task = asyncio.create_task(mgr.chat(session_key="cli", agent="Pi", handle="h1", text="go"))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    (meta_path,) = list(mgr.session_dir_for("cli").rglob("meta.json"))
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["status"] == "running", (
+        "the run is still answering on its machine; the record must not call it cancelled"
+    )
+    registry = InstanceRegistry(tmp_path / "reg.json")
+    rows = [r for r in registry.list_instances("cli") if r.get("handle") == "h1"]
+    assert rows and rows[0]["status"] == "running"
+    assert captured["task_id"] not in remote_runs._LEFT, "the manager reads the marker once, for the pickup"
+
+
 def test_an_agent_that_advertises_no_modes_takes_no_tier_and_no_mode_override(tmp_path, monkeypatch) -> None:
     """The Mirasim adapter's shape, as its handshake is measured: effort as a
     thought_level option and no session modes. The Session Tier has no rung to

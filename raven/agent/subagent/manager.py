@@ -1318,6 +1318,14 @@ class SubagentManager:
                         )
                 except asyncio.CancelledError:
                     cancelled = True
+                    if remote_runs.was_left(task_id):
+                        # This process is stopping and the run goes on under the
+                        # machine's daemon, as the spawn lane reads the same
+                        # marker: nothing is finished or announced here -- the
+                        # next process picks the run up and does both
+                        # (raven.agent.subagent.resume_remote). Marking the
+                        # turn cancelled would contradict the reply it announces.
+                        raise
                     await _write_spawn_status(session_key, agent, handle, "cancelled")
                     record.finish(status="cancelled", activity=did)
                     raise
