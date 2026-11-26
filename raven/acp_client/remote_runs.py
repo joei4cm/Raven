@@ -183,7 +183,7 @@ def claim_path(task: str) -> Path:
 
 
 def claim(task: str) -> bool:
-    """Take the pick-up of ``task`` for this process; ``False`` while a live process of this computer holds it.
+    """Take ``task`` for this process; ``False`` while a live process of this computer holds it.
 
     Two processes of one Raven home can start together -- a gateway and a
     page stack -- and each would pick the same run up: the machine's daemon
@@ -191,8 +191,11 @@ def claim(task: str) -> bool:
     prompt that will never answer it, then reports to the conversation a
     failure the run did not have. So a run is picked up under a claim: a
     file beside its record naming the process that holds it, made whole and
-    linked into place, so two processes cannot both make it. A claim whose
-    process is gone is taken over. :func:`forget` removes it with the
+    linked into place, so two processes cannot both make it. The dispatcher
+    holds the claim from the record's first write (:class:`Tracker`), so the
+    same mechanism that separates two starters also keeps one of them from
+    stealing a run whose dispatcher is still alive -- a claim whose process
+    is gone is taken over. :func:`forget` removes it with the
     record; :func:`release` alone, when the run is left for a later start.
     """
     path = claim_path(task)
@@ -352,12 +355,19 @@ class Tracker:
     picks the run up has to read the turn from its first frame. ``stderr_count``
     is read once, as the prompt goes out: the stderr lines before it are the
     earlier prompts', and a pick-up asks the replay from past them.
+
+    A tracker claims the run for its own process first, so a record is never on
+    disk without an owner naming a live process (:func:`claim`). The pick-up
+    keeps its work to claims it can take over: a run whose dispatcher is still
+    alive is not a left run, whatever it last checkpointed -- the in-flight
+    turn is that process's to finish or to leave for a start after its own.
     """
 
     def __init__(self, run: RemoteRun, *, stderr_count: Callable[[], Any] | None = None) -> None:
         self.run = run
         self.kept = False
         self._stderr_count = stderr_count
+        claim(run.task)
         record(run)
 
     def prompt_sent(self, request_id: int) -> None:

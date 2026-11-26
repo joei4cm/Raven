@@ -2005,6 +2005,11 @@ class AcpAgentBackend:
                             # the machine's daemon, and the manager reads this
                             # dispatch as left, not cancelled.
                             remote_runs.mark_left(task_id)
+                            # The claim a dispatch holds from its record's first
+                            # write is for its owner while it runs; a run handed
+                            # to a later start has none, so it is given up here
+                            # for the next process to take.
+                            remote_runs.release(tracker.run.task)
                         # An UNSETTLED cancel means the turn outlived its cancel
                         # budget, so it is still running on the agent while this lock
                         # is about to be released -- prompting the same session again

@@ -868,6 +868,9 @@ async def test_a_reply_the_caller_reports_keeps_its_record_and_a_host_that_stops
     SpawnRecord.open(session_dir, task_id="t1", task="hi", meta=meta, node_id="n1")
     manager = _Manager(backend, session_dir)
     monkeypatch.setattr(resume_remote, "get_registry", lambda: _Registry())
+    # The claim died with the stop this test simulates: this process is still
+    # alive, so the next start's takeover is said so here.
+    monkeypatch.setattr(remote_runs, "pid_alive", lambda pid: False)
 
     assert await asyncio.wait_for(resume_remote.resume_remote_runs(manager), timeout=30) == 1
 
@@ -1314,6 +1317,9 @@ async def test_a_prompt_that_fails_after_it_went_out_keeps_its_record_for_the_ca
     SpawnRecord.open(session_dir, task_id="t1", task="hi", meta=meta, node_id="n1")
     manager = _Manager(backend, session_dir)
     monkeypatch.setattr(resume_remote, "get_registry", lambda: _Registry())
+    # The dispatcher that kept the record is gone in the story this test tells;
+    # this process still being alive, the takeover is said so here.
+    monkeypatch.setattr(remote_runs, "pid_alive", lambda pid: False)
 
     assert await asyncio.wait_for(resume_remote.resume_remote_runs(manager), timeout=30) == 1
 

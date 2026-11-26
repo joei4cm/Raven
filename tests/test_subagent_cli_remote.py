@@ -995,8 +995,10 @@ async def test_a_reply_the_caller_reports_keeps_the_command_s_record_and_a_host_
         "the record outlives the output, for the manager to forget"
     )
 
-    # This computer stops between the output and its announce.
+    # This computer stops between the output and its announce: its claim on the
+    # run dies with it, and the next start takes both over.
     await box.nodes.close_all()
+    monkeypatch.setattr(remote_runs, "pid_alive", lambda pid: False)
     session_dir = tmp_path / "sessions" / "s1"
     meta = {
         "call_id": "n1",

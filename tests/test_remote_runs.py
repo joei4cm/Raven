@@ -205,6 +205,33 @@ def test_a_claim_left_by_a_process_that_is_gone_is_taken_over(monkeypatch) -> No
     assert remote_runs.claim("blank") is True, "a claim that names nobody holds nothing"
 
 
+def test_a_dispatch_claims_its_own_run_until_it_ends_or_dies(_home: Path, monkeypatch) -> None:
+    """The record a dispatch writes is owned from the start. Every process of
+    this home runs the pick-up once after its own start, and a run with no
+    claim looked like every other left record to it: the daemon hands the task
+    to whichever attaches last, so a second process's start stole a turn the
+    live dispatcher was still in."""
+    remote_runs.Tracker(_run())
+
+    # A later starter's claim -- and with it the whole pick-up -- is refused
+    # while the dispatching process is alive.
+    assert remote_runs.claim("echo@box-1a2b3c4d") is False
+    assert remote_runs.claim_path("echo@box-1a2b3c4d").read_text(encoding="utf-8") == str(os.getpid())
+
+    # A run kept for the caller to report keeps its owner with it: it is still
+    # this process's run, not a left one.
+    remote_runs.Tracker(_run("kept")).close(keep=True)
+    assert remote_runs.claim("kept") is False
+
+    # The dispatcher gone, the claim is taken over as every claim's is; the
+    # record's removal takes the claim with it either way.
+    monkeypatch.setattr(remote_runs, "pid_alive", lambda pid: False)
+    assert remote_runs.claim("echo@box-1a2b3c4d") is True
+    remote_runs.forget("echo@box-1a2b3c4d")
+    remote_runs.forget("kept")
+    assert not remote_runs.claim_path("echo@box-1a2b3c4d").exists() and not remote_runs.claim_path("kept").exists()
+
+
 def test_two_starters_taking_over_one_dead_holder_leave_one_claim(monkeypatch) -> None:
     """A judged the claim dead and took it; B, who judged it dead a moment earlier, must not remove A's.
 

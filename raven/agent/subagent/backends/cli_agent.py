@@ -742,6 +742,11 @@ class CliAgentBackend:
                 from raven.acp_client import remote_runs
 
                 remote_runs.mark_left(task_id)
+                # The claim a dispatch holds from its record's first write is
+                # for its owner while it runs; a run handed to a later start
+                # has none, so it is given up here for the next process to take
+                # -- not left to die with this one.
+                remote_runs.release(tracker.run.task)
             _untrack(tracker, keep=left)
             raise
         except BaseException:
