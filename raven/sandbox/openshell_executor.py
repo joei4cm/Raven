@@ -901,21 +901,28 @@ class OpenShellExecutor(SandboxExecutor):
         Deletion blocks for seconds on the gateway, so it is not awaited here;
         ``drain_pending_deletes`` waits for it, and a sandbox orphaned by a
         crash is collected by the next process's ``start()``.
+
+        Under the same lock ``start()`` takes: a stop that slipped past an
+        in-flight start read ``_name`` before it was set, deleted nothing, and
+        let the plane go anyway -- and the sandbox the start went on to commit
+        was then running with no name or plane held to delete it with, so a
+        later stop could not collect it either.
         """
-        for stream in self._processes:
-            stream.cancel()
-        self._processes.clear()
-        for task in self._tasks:
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
-        name, self._name = self._name, None
-        plane = self._control_plane
-        if name is not None and plane is not None:
-            _spawn_delete(plane, name)
-            logger.info("OpenShell sandbox %s stopping", name)
-        self._let_go_of_plane()
+        async with self._start_lock:
+            for stream in self._processes:
+                stream.cancel()
+            self._processes.clear()
+            for task in self._tasks:
+                task.cancel()
+            if self._tasks:
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks.clear()
+            name, self._name = self._name, None
+            plane = self._control_plane
+            if name is not None and plane is not None:
+                _spawn_delete(plane, name)
+                logger.info("OpenShell sandbox %s stopping", name)
+            self._let_go_of_plane()
 
     def _let_go_of_plane(self) -> None:
         """Release a plane this executor built, to close after every delete queued on it; a restart builds a fresh one.

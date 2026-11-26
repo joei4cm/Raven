@@ -1007,6 +1007,32 @@ class TestStop:
         await ox.drain_pending_deletes()
         assert cp.deleted == [name]
 
+    async def test_a_stop_that_meets_an_in_flight_start_still_deletes(self, tmp_path):
+        """A stop that slipped past an in-flight start read ``_name`` before it
+        was set, deleted nothing, and let the plane go anyway -- the sandbox the
+        start went on to commit then ran with no name or plane held to delete it
+        with, and no later stop could collect it either."""
+        made = threading.Event()
+        release = threading.Event()
+
+        class SlowStart(FakeControlPlane):
+            def create(self, **kwargs):
+                super().create(**kwargs)
+                made.set()
+                release.wait(10)
+
+        cp = SlowStart()
+        ex = _executor(tmp_path, cp)
+        starting = asyncio.create_task(ex.start())
+        # In a thread: a plain wait() would hold the loop itself and the start
+        # could never reach create.
+        assert await asyncio.to_thread(made.wait, 5)
+        stopping = asyncio.create_task(ex.stop())
+        release.set()
+        await asyncio.gather(starting, stopping)
+        await ox.drain_pending_deletes()
+        assert cp.deleted == [cp.created[0]["name"]]
+
     async def test_a_plane_the_executor_built_is_closed_once_its_sandbox_is_deleted(self, tmp_path, monkeypatch):
         """The SDK client holds a gRPC channel and any OIDC refresher; sub-agents, DAG
         nodes and render jobs each build one, and an unclosed one leaks until GC."""
