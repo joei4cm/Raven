@@ -202,6 +202,10 @@ async def test_a_stream_the_host_closes_ends_the_bridge_and_a_bridge_of_no_task_
         await _agent(host, root, tmp_path, task="a@box-1")
         await host.say('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n')
         await host.until(lambda: host.notified(protocol.MCP_OPEN))
+        # Carried before the stream is closed: a frame still on its way when the
+        # daemon hangs up meets the closed socket, and that ending says nothing
+        # (it is the one the in-process test below has a stand-in for).
+        await host.until(lambda: host.notified(protocol.MCP_FRAME))
         await host.tell(protocol.MCP_CLOSE, {"stream": 1, "reason": "the dispatch ended"})
         await host.until(lambda: host.lines())
         assert host.lines() == ["BRIDGE_EXIT 0 raven node mcp bridge: the stream ended: the dispatch ended"], (
