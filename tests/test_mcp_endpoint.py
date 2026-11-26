@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 from unittest import mock
@@ -535,3 +536,50 @@ async def test_an_entry_naming_another_servers_tool_does_not_deny_this_one():
         await endpoints.aclose()
 
     assert [tool["name"] for tool in replies[1]["result"]["tools"]] == ["search", "delete", "actions/download-logs"]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="the ownership check needs POSIX accounts")
+def test_socket_dir_refuses_a_folder_somebody_else_owns(monkeypatch, tmp_path):
+    """A pre-created folder under another account's name is refused, not used.
+
+    ``mkdir(exist_ok=True)`` used to accept it silently: at best every bind
+    failed with EACCES, and in a loose folder the deterministic socket names
+    could be unlinked and rebound by the other account, with nothing on a
+    unix socket authenticating the peer.
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(os, "geteuid", lambda: 4242)
+    foreign = tmp_path / "raven-mcp-4242"
+    foreign.mkdir()
+    with pytest.raises(OSError, match="owned by uid"):
+        endpoint.socket_dir()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="the ownership check needs POSIX accounts")
+def test_socket_dir_tightens_a_folder_we_left_loose(monkeypatch, tmp_path):
+    """A folder this account owns but left group/other-accessible is tightened.
+
+    The mode argument on ``mkdir`` only applies at creation, so a folder made
+    by an older build or under a permissive umask stayed as loose as it was.
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    ours = tmp_path / f"raven-mcp-{os.geteuid()}"
+    ours.mkdir()
+    ours.chmod(0o777)
+    d = endpoint.socket_dir()
+    assert d == ours
+    assert stat.S_IMODE(d.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="the ownership check needs POSIX accounts")
+def test_socket_dir_names_the_folder_per_account(monkeypatch, tmp_path):
+    """Two accounts on one host do not share one socket folder.
+
+    With one shared name, the second account on a multi-user host could never
+    get past the first's 0o700 folder; naming it per account keeps both
+    working, and the ownership check still refuses a folder it did not make.
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    d = endpoint.socket_dir()
+    assert d == tmp_path / f"raven-mcp-{os.geteuid()}"
+    assert stat.S_IMODE(d.stat().st_mode) == 0o700

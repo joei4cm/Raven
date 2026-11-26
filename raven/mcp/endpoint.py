@@ -69,8 +69,27 @@ def _jsonrpc_adapter() -> Any:
 
 
 def socket_dir() -> Path:
-    d = Path(tempfile.gettempdir()) / _SOCKET_SUBDIR
+    """The folder this account's endpoint sockets live under, made safe to use.
+
+    The temp directory is shared, so the folder is named per account where the
+    platform can tell accounts apart -- and one that exists already is only
+    used if this account owns it and it is not loose: a folder somebody else
+    owns turns every bind into EACCES at best, and a loose one lets them
+    unlink and rebind the deterministic socket names, which nothing on a unix
+    socket authenticates.
+    """
+    name = _SOCKET_SUBDIR
+    per_user = hasattr(os, "geteuid")
+    if per_user:
+        name = f"{name}-{os.geteuid()}"
+    d = Path(tempfile.gettempdir()) / name
     d.mkdir(mode=0o700, exist_ok=True)
+    if per_user:
+        st = d.stat()
+        if st.st_uid != os.geteuid():
+            raise OSError(f"refusing socket directory {d}: owned by uid {st.st_uid}, not by this account")
+        if st.st_mode & 0o077:
+            os.chmod(d, 0o700)
     return d
 
 
