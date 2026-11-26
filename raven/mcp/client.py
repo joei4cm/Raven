@@ -447,11 +447,22 @@ async def connect_mcp_server(
     sandbox = (
         executor if transport_type == "stdio" and executor is not None and executor.supports_process_spawning else None
     )
-    for tool_def in tools:
-        wrapper = MCPToolWrapper(
-            session, name, tool_def, tool_timeout=cfg.tool_timeout, taken=registry, executor=sandbox
-        )
-        registry.register(wrapper, origin=wrapper.ref)
-        registered.append(wrapper.name)
-        logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
+    try:
+        for tool_def in tools:
+            wrapper = MCPToolWrapper(
+                session, name, tool_def, tool_timeout=cfg.tool_timeout, taken=registry, executor=sandbox
+            )
+            registry.register(wrapper, origin=wrapper.ref)
+            registered.append(wrapper.name)
+            logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
+    except BaseException:
+        # A raise mid-list -- a tool definition the SDK shapes badly, a rule
+        # admission refuses -- leaves the earlier tools in the registry pointing
+        # at a session the caller is about to close: the model would see tools
+        # that always fail until a disconnect swept the server. What this loop
+        # put in it takes back out, so the caller's abort finds nothing of
+        # ours left to roll back.
+        for tool_name in registered:
+            registry.unregister(tool_name)
+        raise
     return Connected(names=registered, session=session, capabilities=handshake.capabilities)

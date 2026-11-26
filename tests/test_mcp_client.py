@@ -6,6 +6,7 @@ import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 
+import pytest
 from mcp.types import CallToolResult, TextContent
 
 from raven.agent.tools.registry import ToolRegistry
@@ -418,3 +419,44 @@ async def test_a_refusal_is_read_only_while_the_call_ran_and_not_pinned_on_the_t
     ((since, until),) = sandbox.windows
     assert until is not None and since <= until
     assert asked[0]["evidence"]["command"] == "a process in the sandbox while the MCP tool server-x.fetch ran"
+
+
+async def test_a_registration_that_dies_mid_list_takes_its_tools_back_out(monkeypatch) -> None:
+    """A raise in the middle of the list leaves no tool registered behind it.
+
+    ``register`` can refuse the third tool of five: a tool definition the SDK
+    shapes badly, or a rule admission refuses. The tools before it used to
+    stay in the registry pointing at a session the caller then closes -- the
+    model saw tools that always fail until a disconnect swept the server.
+    The loop now takes back out what it put in and re-raises, so the caller's
+    abort finds nothing of ours left to roll back.
+    """
+    import mcp
+
+    import raven.mcp.client as client_mod
+
+    pages = {None: SimpleNamespace(tools=[_tool_def("a"), _tool_def("b"), _tool_def("c")], next_cursor=None)}
+    session_cls, _asked = _paged_session(pages)
+    monkeypatch.setattr(mcp, "ClientSession", session_cls)
+    monkeypatch.setattr(client_mod, "open_mcp_transport", _fake_transport)
+
+    cfg = MCPServerConfig(url="https://example.test/mcp")
+    reg = ToolRegistry()
+    real_register = reg.register
+    seen = {"n": 0}
+
+    def dies_on_the_second(wrapper, *, origin):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise RuntimeError("admission exploded")
+        return real_register(wrapper, origin=origin)
+
+    monkeypatch.setattr(reg, "register", dies_on_the_second)
+
+    async with AsyncExitStack() as stack:
+        with pytest.raises(RuntimeError, match="admission exploded"):
+            await connect_mcp_server("srv", cfg, reg, stack)
+
+    assert seen["n"] == 2
+    assert not any(reg.has(tool_name) for tool_name in ("mcp_srv_a", "mcp_srv_b", "mcp_srv_c"))
+    assert reg.names() == []
