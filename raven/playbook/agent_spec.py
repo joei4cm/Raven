@@ -82,9 +82,14 @@ class CheckRule(CamelBase):
 class Checks(CamelBase):
     """The judgement seat, and the data the shipped judge reads.
 
-    ``impl`` is a registry id, never a path: naming a file would put the choice
-    of what to load on the writer of a generated document, and a registry id
-    can only select something this install already ships.
+    ``impl`` is reserved, not offered. The catalogue keeps ``action.checksImpl``
+    disabled, so a Harness that names one is refused as a disabled field --
+    the shipped default included, since the field is withheld rather than
+    defaulted -- and nothing this build ships reads it. The registry-id rule is
+    recorded now because it is the one that will apply once it is wired: a
+    registry id, never a path, since naming a file would put the choice of what
+    to load on the writer of a generated document, and a registry id can only
+    select something this install already ships.
     """
 
     impl: str = "default"

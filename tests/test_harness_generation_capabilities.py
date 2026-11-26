@@ -473,10 +473,27 @@ def test_persona_generator_refuses_fields_it_cannot_preserve(extra, message) -> 
             "unknown generated participant function: memory.archive",
         ),
         ({"memory": {"functions": {"intake": ""}}}, "generated participant function is empty: memory.intake"),
-        ({"action": {"checks": {"impl": "custom"}}}, "disabled harness field.*action.checksImpl"),
+        pytest.param(
+            {"action": {"checks": {"impl": "custom"}}},
+            "disabled harness field.*action.checksImpl",
+            id="a-check-implementation-is-named",
+        ),
+        pytest.param(
+            {"action": {"checks": {"impl": "default"}}},
+            "disabled harness field.*action.checksImpl",
+            id="the-default-check-implementation-is-named",
+        ),
     ],
 )
 def test_stored_playbook_refuses_unknown_empty_and_disabled_fields(playbook, message) -> None:
+    """``checksImpl`` is withheld, not defaulted.
+
+    Naming the shipped default is refused on the same ground as naming any
+    other implementation, so the field is reserved until a registry exists to
+    select from rather than merely kept off for the values this build has no
+    implementation for. Letting the default through would read as the field
+    being offered, and the reload path beside it would then re-emit it.
+    """
     with pytest.raises(ValidationError, match=message):
         AgentPlaybookSpec.model_validate({"delegate": [{"name": "worker", "playbook": playbook}]})
 
